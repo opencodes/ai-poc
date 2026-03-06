@@ -14,12 +14,19 @@ const AI_PROVIDER = (process.env.AI_PROVIDER || "openai").toLowerCase();
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_EMBEDDING_MODEL = process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
 
-const HF_TEXT_MODEL = process.env.HF_TEXT_MODEL || "HuggingFaceH4/zephyr-7b-beta";
+const HF_TEXT_MODEL = process.env.HF_TEXT_MODEL || "Qwen/Qwen2.5-7B-Instruct";
 const HF_EMBED_MODEL = process.env.HF_EMBED_MODEL || "sentence-transformers/all-MiniLM-L6-v2";
 const HF_API_KEY = process.env.HF_API_KEY || "";
+const HF_BASE_URL = process.env.HF_BASE_URL || "";
 
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-const hfBaseUrl = "https://api-inference.huggingface.co/models";
+const hfBaseUrl = HF_BASE_URL.replace(/\/+$/, "");
+const hfRouterV1BaseUrl = hfBaseUrl.includes("router.huggingface.co")
+  ? "https://router.huggingface.co/v1"
+  : hfBaseUrl.endsWith("/v1")
+    ? hfBaseUrl
+    : "";
+const hfOpenAI = HF_API_KEY && hfRouterV1BaseUrl ? new OpenAI({ apiKey: HF_API_KEY, baseURL: hfRouterV1BaseUrl }) : null;
 
 let todos = [];
 let nextId = 1;
@@ -99,8 +106,21 @@ function normalizeEmbedding(raw) {
   return null;
 }
 
+function hashEmbedding(text, dims = 128) {
+  const out = new Array(dims).fill(0);
+  const input = String(text || "");
+  for (let i = 0; i < input.length; i += 1) {
+    const code = input.charCodeAt(i);
+    const idx = (code * 31 + i * 17) % dims;
+    out[idx] += ((code % 23) - 11) / 11;
+  }
+  const norm = Math.sqrt(out.reduce((acc, n) => acc + n * n, 0));
+  if (!norm) return out;
+  return out.map((n) => n / norm);
+}
+
 function isProviderConfigured() {
-  if (AI_PROVIDER === "huggingface") return Boolean(HF_API_KEY);
+  if (AI_PROVIDER === "huggingface") return Boolean(HF_API_KEY && hfBaseUrl);
   return Boolean(openai);
 }
 
@@ -111,7 +131,11 @@ function ensureProvider(res) {
   }
   if (!isProviderConfigured()) {
     if (AI_PROVIDER === "huggingface") {
-      res.status(400).json({ error: "HF_API_KEY is missing. Add it to backend/.env." });
+      if (!HF_API_KEY) {
+        res.status(400).json({ error: "HF_API_KEY is missing. Add it to backend/.env." });
+        return false;
+      }
+      res.status(400).json({ error: "HF_BASE_URL is missing. Add it to backend/.env." });
       return false;
     }
     res.status(400).json({ error: "OPENAI_API_KEY is missing. Add it to backend/.env." });
@@ -121,7 +145,20 @@ function ensureProvider(res) {
 }
 
 async function hfRequest(model, payload) {
-  const response = await fetch(`${hfBaseUrl}/${model}`, {
+  const modelPath = String(model || "").replace(/^\/+/, "");
+  const endpoint = hfBaseUrl.includes("{model}")
+    ? hfBaseUrl.replace("{model}", modelPath)
+    : `${hfBaseUrl}/${modelPath}`;
+
+  // Keep compatibility with router base URLs by expanding only raw router paths.
+  const requestUrl =
+    endpoint.startsWith("https://router.huggingface.co/") && !endpoint.includes("/hf-inference/models/")
+      ? endpoint.replace("https://router.huggingface.co/", "https://router.huggingface.co/hf-inference/models/")
+      : endpoint;
+
+  console.log(requestUrl);
+
+  const response = await fetch(requestUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -132,7 +169,8 @@ async function hfRequest(model, payload) {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const message = data?.error || `Hugging Face request failed (${response.status})`;
+    const message = data?.error || `Hugging Face request failed (${response.status}) at ${requestUrl}`;
+    console.log(message);
     throw new Error(message);
   }
 
@@ -141,6 +179,19 @@ async function hfRequest(model, payload) {
 
 async function generateText({ system, user, temperature = 0.3, maxTokens = 220 }) {
   if (AI_PROVIDER === "huggingface") {
+    if (hfOpenAI) {
+      const response = await hfOpenAI.chat.completions.create({
+        model: HF_TEXT_MODEL,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ],
+        temperature,
+        max_tokens: maxTokens
+      });
+      return response.choices[0]?.message?.content || "";
+    }
+
     const prompt = `${system}\n\nUser: ${user}\nAssistant:`;
     const data = await hfRequest(HF_TEXT_MODEL, {
       inputs: prompt,
@@ -172,11 +223,24 @@ async function generateText({ system, user, temperature = 0.3, maxTokens = 220 }
 
 async function embedText(text) {
   if (AI_PROVIDER === "huggingface") {
-    const data = await hfRequest(HF_EMBED_MODEL, {
-      inputs: text,
-      options: { wait_for_model: true }
-    });
-    return normalizeEmbedding(data);
+    try {
+      if (hfOpenAI) {
+        const resp = await hfOpenAI.embeddings.create({
+          model: HF_EMBED_MODEL,
+          input: text
+        });
+        return resp.data[0]?.embedding || hashEmbedding(text);
+      }
+
+      const data = await hfRequest(HF_EMBED_MODEL, {
+        inputs: text,
+        options: { wait_for_model: true }
+      });
+      return normalizeEmbedding(data) || hashEmbedding(text);
+    } catch {
+      // Keep semantic flows working even if HF embedding route/model is unavailable.
+      return hashEmbedding(text);
+    }
   }
 
   const resp = await openai.embeddings.create({
